@@ -202,16 +202,23 @@ export class TaskEngine {
 
       let sessionID: string
       try {
-        const created = await this.ctx.session.create({
-          id: `task-${task.id}-${iteration}-${startedAt}`,
-          title: `⏱ ${task.id} · run ${iteration}`,
-          agent: task.agent,
-          model: task.model,
-          location: { directory: this.ctx.location.directory },
-          permissions: task.budget.autoApprove
-            ? [{ action: "*", resource: "*", effect: "allow" }, ...(task.budget.deny ?? []).map((d) => ({ action: "bash", resource: d, effect: "deny" }))]
-            : task.permissions,
+        const baseUrl = "http://127.0.0.1:49374"
+        const resp = await fetch(`${baseUrl}/api/session`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            id: `task-${task.id}-${iteration}-${startedAt}`,
+            title: `⏱ ${task.id} · run ${iteration}`,
+            agent: task.agent,
+            model: task.model,
+            location: { directory: this.ctx.location.directory },
+            permissions: task.budget.autoApprove
+              ? [{ action: "*", resource: "*", effect: "allow" }, ...(task.budget.deny ?? []).map((d) => ({ action: "bash", resource: d, effect: "deny" }))]
+              : task.permissions,
+          }),
         })
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+        const created = await resp.json()
         sessionID = created.data.id
         await this.log(task.id, "session-created", { sessionID, iteration })
       } catch (err) {
