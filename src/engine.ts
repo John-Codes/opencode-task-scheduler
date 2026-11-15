@@ -15,6 +15,27 @@ interface RunCtx {
   startedAt: number
 }
 
+interface SessionApiLike {
+  create: (input: {
+    id?: string; title?: string; agent?: string; model?: { providerID: string; id: string };
+    location?: { directory: string }; metadata?: Record<string, unknown>;
+    permissions?: { action: string; resource: string; effect: "allow" | "ask" | "deny" }[]
+  }) => Promise<{ id: string }>
+  get: (input: { sessionID: string }) => Promise<any>
+  prompt: (input: { sessionID: string; text: string; delivery?: "steer" | "queue" }) => Promise<any>
+  wait: (input: { sessionID: string }) => Promise<void>
+  interrupt: (input: { sessionID: string; resume?: boolean }) => Promise<{ interrupted: boolean }>
+  update: (input: { sessionID: string; title?: string }) => Promise<void>
+  remove: (input: { sessionID: string }) => Promise<void>
+  context: (input: { sessionID: string }) => Promise<{ data: any[] }>
+  instructions: {
+    entry: {
+      put: (input: { sessionID: string; key: string; value: string }) => Promise<void>
+      remove: (input: { sessionID: string; key: string }) => Promise<void>
+    }
+  }
+}
+
 export class TaskEngine {
   private timers = new Map<string, ReturnType<typeof setTimeout>>()
   private locks = new Set<string>()
@@ -22,22 +43,7 @@ export class TaskEngine {
 
   constructor(
     private ctx: {
-      session: {
-        create: (input: { id?: string; title?: string; agent?: string; model?: { providerID: string; id: string }; location?: { directory: string }; metadata?: Record<string, unknown>; permissions?: { action: string; resource: string; effect: "allow" | "ask" | "deny" }[] }) => Promise<{ id: string }>
-        get: (input: { sessionID: string }) => Promise<any>
-        prompt: (input: { sessionID: string; text: string; delivery?: "steer" | "queue" }) => Promise<any>
-        wait: (input: { sessionID: string }) => Promise<void>
-        interrupt: (input: { sessionID: string; resume?: boolean }) => Promise<{ interrupted: boolean }>
-        update: (input: { sessionID: string; title?: string }) => Promise<void>
-        remove: (input: { sessionID: string }) => Promise<void>
-        context: (input: { sessionID: string }) => Promise<{ data: any[] }>
-        instructions: {
-          entry: {
-            put: (input: { sessionID: string; key: string; value: string }) => Promise<void>
-            remove: (input: { sessionID: string; key: string }) => Promise<void>
-          }
-        }
-      }
+      session: SessionApiLike
       tool: {
         transform: (cb: (editor: { add: (t: any) => void; remove: (id: string) => void }) => void) => Promise<{ dispose: () => Promise<void> }>
         reload: () => Promise<void>
@@ -46,6 +52,7 @@ export class TaskEngine {
         transform: (cb: (editor: { add: (d: { name: string; description?: string; execute: (i: any) => Promise<void> }) => void }) => void) => Promise<{ dispose: () => Promise<void> }>
       }
       storage: { get: (k: string) => Promise<any>; set: (k: string, v: any) => Promise<void>; remove: (k: string) => Promise<void> }
+      location: { directory: string }
     },
     private tasks: TaskConfig[],
   ) {
@@ -55,6 +62,12 @@ export class TaskEngine {
   private store: TaskStore
 
   async setup() {
+    await this.ctx.storage.set("task-scheduler:setup-log", {
+      event: "engine-setup",
+      taskCount: this.tasks.length,
+      at: Date.now(),
+    })
+
     // Register task-control tools the agent can call during loops.
     await this.ctx.tool.transform((editor) => {
       const shared: TaskControlState = {
@@ -68,8 +81,6 @@ export class TaskEngine {
         startedAt: 0,
         deadlineMs: null,
       }
-      // We reset per-run via runCtx below; this shared placeholder keeps the
-      // tool signature stable. Per-run state is injected at run start.
       for (const t of taskControlTools(shared)) editor.add(t)
     })
     await this.ctx.tool.reload()
@@ -104,17 +115,28 @@ export class TaskEngine {
     this.runs.clear()
   }
 
+  private async log(taskID: string, event: string, data: any) {
+    await this.ctx.storage.set(`task-scheduler:log:${taskID}:${Date.now()}`, {
+      taskID, event, data, at: Date.now(),
+    })
+  }
+
   private arm(task: TaskConfig) {
     if (this.locks.has(task.id)) return
     this.locks.add(task.id)
-    console.error(`[task-scheduler] arming task ${task.id} (start: ${task.start})`)
     void this.runLoop(task).catch((err) => {
-      console.error(`[task-scheduler] task ${task.id} loop error:`, err)
+      void this.ctx.storage.set(`task-scheduler:error:${task.id}`, {
+        taskID: task.id,
+        error: String(err),
+        stack: (err as Error)?.stack,
+        at: Date.now(),
+      })
       this.locks.delete(task.id)
     })
   }
+
   private async runLoop(task: TaskConfig) {
-    console.error(`[task-scheduler] runLoop entered for task ${task.id}`)
+    await this.log(task.id, "runLoop-entered", { every: task.loop.every, maxIterations: task.loop.maxIterations })
     const everyMs = task.loop.every ? parseEvery(task.loop.every) : 0
     let iteration = 0
 
@@ -132,23 +154,27 @@ export class TaskEngine {
         run = await this.startRun(task, iteration)
         this.runs.set(task.id, run)
         await this.store.setRunning(task.id, true)
+        await this.log(task.id, "iteration-started", { iteration, sessionID: run.sessionID })
 
         const result = await this.runIteration(run)
 
         if (result.stop) {
           await this.finishRun(task, run, result.outcome, result.summary)
+          await this.log(task.id, "run-stopped", { iteration, outcome: result.outcome, summary: result.summary })
           break
         }
 
         // check deadline
         if (run.deadlineMs && Date.now() >= run.deadlineMs) {
           await this.finishRun(task, run, "timed-out", `Deadline reached after ${formatMinutes(Date.now() - run.startedAt)}`)
+          await this.log(task.id, "run-timed-out", { iteration })
           break
         }
 
         // check cost budget
         if (task.budget.maxCostUSD != null && result.costUSD >= task.budget.maxCostUSD) {
           await this.finishRun(task, run, "timed-out", `Cost budget reached ($${task.budget.maxCostUSD})`)
+          await this.log(task.id, "run-cost-budget", { iteration })
           break
         }
       } catch (err) {
@@ -156,6 +182,7 @@ export class TaskEngine {
           taskID: task.id,
           iteration,
           error: String(err),
+          stack: (err as Error)?.stack,
           at: Date.now(),
         })
         throw err
@@ -173,6 +200,7 @@ export class TaskEngine {
 
     this.locks.delete(task.id)
     await this.store.setRunning(task.id, false)
+    await this.log(task.id, "runLoop-completed", { finalIteration: iteration })
   }
 
   private async startRun(task: TaskConfig, iteration: number): Promise<RunCtx> {
@@ -193,7 +221,7 @@ export class TaskEngine {
     }
 
     // Re-register tools with per-run state so the executor closes over this run.
-    const reg = await this.ctx.tool.transform((editor) => {
+    await this.ctx.tool.transform((editor) => {
       for (const t of taskControlTools(state)) editor.add(t)
     })
 
@@ -215,9 +243,15 @@ export class TaskEngine {
             : task.permissions,
         })
         sessionID = created.id
-        console.error(`[task-scheduler] created session ${sessionID} for task ${task.id} iteration ${iteration}`)
+        await this.log(task.id, "session-created", { sessionID, iteration })
       } catch (err) {
-        console.error(`[task-scheduler] session.create failed for task ${task.id}:`, err)
+        await this.ctx.storage.set(`task-scheduler:error:${task.id}`, {
+          taskID: task.id,
+          iteration,
+          error: `session.create failed: ${String(err)}`,
+          stack: (err as Error)?.stack,
+          at: Date.now(),
+        })
         throw err
       }
     }
@@ -230,7 +264,7 @@ export class TaskEngine {
         value: `TASK: ${task.prompt}\nSTOP WHEN: the agent calls task_done, or the deadline of ${new Date(deadlineMs).toISOString()} is reached.\nYou may call task_extend(minutes, reason) if you need more time.\nCurrent iteration: ${iteration}`,
       })
     } catch (err) {
-      console.error(`[task-scheduler] instructions.entry.put failed for task ${task.id}:`, err)
+      await this.log(task.id, "instructions-put-failed", { error: String(err) })
       // non-fatal, continue
     }
 
@@ -239,13 +273,12 @@ export class TaskEngine {
 
   private async currentOrCreateSession(task: TaskConfig): Promise<string> {
     try {
-      // best effort: find an active session at this location
-      // (no list API guaranteed; create a fresh one if unsure)
       const created = await this.ctx.session.create({
         id: `task-${task.id}-${Date.now()}`,
         title: `⏱ ${task.id} · run`,
         agent: task.agent,
         model: task.model,
+        location: { directory: this.ctx.location.directory },
         permissions: task.budget.autoApprove
           ? [{ action: "*", resource: "*", effect: "allow" }, ...(task.budget.deny ?? []).map((d) => ({ action: "bash", resource: d, effect: "deny" }))]
           : task.permissions,
@@ -271,7 +304,6 @@ export class TaskEngine {
     try {
       await this.ctx.session.wait({ sessionID })
     } catch {
-      // wait may not be available on older servers; fall back to a short sleep
       await sleep(2_000)
     }
 
@@ -324,19 +356,17 @@ export class TaskEngine {
 
   private async finishRun(task: TaskConfig, run: RunCtx, outcome: string, summary?: string) {
     await this.ctx.session.instructions.entry.remove({ sessionID: run.sessionID, key: "task-scheduler/goal" }).catch(() => {})
-    const c = 0 // cost read during iteration; stored via store
     await this.store.appendRun(task.id, {
       taskID: task.id,
       runIndex: run.iteration,
       startedAt: run.startedAt,
       endedAt: Date.now(),
       outcome: outcome as any,
-      costUSD: c,
+      costUSD: 0,
       tokens: 0,
       summary,
     })
 
-    // Notify via TUI-facing storage so the TUI part can show toasts.
     await this.ctx.storage.set(`task-scheduler:last-event:${task.id}`, {
       taskID: task.id,
       runIndex: run.iteration,
@@ -355,11 +385,15 @@ export class TaskEngine {
       const task = this.tasks.find((t) => t.id === id)
       if (!task) { await this.reply(sessionID, `Unknown task: ${id}`); return }
       if (this.locks.has(task.id)) { await this.reply(sessionID, `Task ${id} is already running`); return }
-      console.error(`[task-scheduler] manual run ${id} started`)
       this.locks.add(task.id)
       void this.runLoop(task).catch((err) => {
-        console.error(`[task-scheduler] manual run ${id} error:`, err)
-        this.locks.delete(task.id)
+        void this.ctx.storage.set(`task-scheduler:error:${id}`, {
+          taskID: id,
+          error: String(err),
+          stack: (err as Error)?.stack,
+          at: Date.now(),
+        })
+        this.locks.delete(id)
       })
       await this.reply(sessionID, `Started task ${id}`)
     } else if (verb === "stop") {
