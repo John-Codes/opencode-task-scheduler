@@ -1,17 +1,24 @@
 import { Plugin } from "@opencode/plugin/tui"
 import type { JSX } from "@opentui/solid"
-import { formatMinutes } from "./runner.js"
+import { parseEvery, jitter, type TaskConfig } from "./schedule.js"
+import { readLastOutcome, costUSD, formatMinutes } from "./runner.js"
+
+interface TuiOptions {
+  tasks?: TaskConfig[]
+}
 
 export default Plugin.define({
   id: "task-scheduler",
   setup(context) {
-    const { client, ui, attention, options } = context
+    const { client, ui, attention, location, options } = context
+    const tasks: TaskConfig[] = (options as TuiOptions)?.tasks ?? []
 
-    // Read tasks from config (stored by server part)
-    const tasks: any[] = (options as any)?.tasks ?? []
-
-    // Running state read from storage
-    const running = new Map<string, { sessionID: string; iteration: number; deadlineMs: number }>()
+    const running = new Map<string, {
+      sessionID: string
+      iteration: number
+      deadlineMs: number
+      abort: AbortController
+    }>()
 
     // Footer status slot
     const footerUnsub = ui.slot({
@@ -26,24 +33,145 @@ export default Plugin.define({
       },
     })
 
-    // Poll storage for run events and update running map
+    async function createTaskSession(task: TaskConfig, iteration: number): Promise<string> {
+      const created = await client.session.create({
+        id: `task-${task.id}-${iteration}-${Date.now()}`,
+        title: `⏱ ${task.id} · run ${iteration}`,
+        location: { directory: location?.directory ?? "/home/aisurvivor" },
+      })
+      return created.data.id
+    }
+
+    async function runTaskLoop(task: TaskConfig) {
+      const everyMs = task.loop.every ? parseEvery(task.loop.every) : 0
+      let iteration = 0
+
+      if (task.loop.initialDelay) {
+        await sleep(parseEvery(task.loop.initialDelay))
+      }
+
+      // Create ONE session for the entire run
+      let sessionID: string
+      try {
+        sessionID = await createTaskSession(task, 1)
+      } catch (err) {
+        ui.toast.show({ title: `task-scheduler ${task.id}`, message: `Session create failed: ${err}`, variant: "error" })
+        return
+      }
+
+      running.set(task.id, { sessionID, iteration: 0, deadlineMs: 0, abort: new AbortController() })
+
+      if (task.focus !== "never") {
+        try {
+          ui.tabs.focus(sessionID)
+          ui.router.navigate({ type: "session", sessionID })
+        } catch {}
+      }
+
+      const startedAt = Date.now()
+      const deadlineMs = startedAt + task.budget.minutes * 60_000
+
+      try {
+        while (true) {
+          iteration++
+          const entry = running.get(task.id)
+          if (!entry || entry.sessionID !== sessionID) break
+
+          if (task.loop.maxIterations != null && iteration > task.loop.maxIterations) break
+          if (Date.now() >= deadlineMs) {
+            ui.toast.show({ title: `task-scheduler ${task.id}`, message: "Deadline reached", variant: "warning" })
+            await attention.notify({
+              title: `Task ${task.id} timed out`,
+              message: `Deadline of ${task.budget.minutes} min reached`,
+              notification: "always",
+              sound: { name: "done", when: "always" },
+            })
+            break
+          }
+
+          const text = iteration === 1 ? task.prompt : (task.continuePrompt ?? `Continue. Iteration ${iteration}.`)
+          const minsLeft = Math.max(0, Math.ceil((deadlineMs - Date.now()) / 60_000))
+          const fullText = `${text}\n\n[time left: ${minsLeft} min][iteration: ${iteration}]`
+
+          await client.session.update({ sessionID, title: `⏱ ${task.id} · run ${iteration}` })
+          await client.session.prompt({ sessionID, text: fullText, delivery: "steer" })
+
+          try {
+            await client.session.wait({ sessionID })
+          } catch {
+            await sleep(2_000)
+          }
+
+          const ctx = await client.session.context({ sessionID })
+          const messages = ctx.data ?? []
+          const { outcome, cost, tokens } = readLastOutcome(messages)
+          const c = costUSD(cost)
+
+          if (task.budget.maxCostUSD != null && c >= task.budget.maxCostUSD) {
+            ui.toast.show({ title: `task-scheduler ${task.id}`, message: "Cost budget reached", variant: "warning" })
+            break
+          }
+
+          if (iteration >= (task.loop.maxIterations || 999)) {
+            ui.toast.show({ title: `task-scheduler ${task.id}`, message: "Max iterations reached", variant: "info" })
+            break
+          }
+
+          if (everyMs <= 0) continue
+          await sleep(jitter(everyMs, 0.1))
+        }
+
+        await attention.notify({
+          title: `Task ${task.id} finished`,
+          message: `Iteration ${iteration} complete`,
+          notification: "always",
+          sound: { name: "done", when: "always" },
+        })
+        ui.toast.show({ title: `task-scheduler ${task.id}`, message: `Finished after ${iteration} iteration(s)`, variant: "success" })
+      } finally {
+        running.delete(task.id)
+      }
+    }
+
+    // Arm startup tasks
+    for (const task of tasks) {
+      if (task.start === "startup") {
+        void runTaskLoop(task).catch((err) => {
+          ui.toast.show({ title: `task-scheduler ${task.id}`, message: `Error: ${err}`, variant: "error" })
+          running.delete(task.id)
+        })
+      }
+    }
+
+    // Poll for run/stop intents from server part
     const pollInterval = setInterval(async () => {
       try {
         for (const task of tasks) {
-          const event = await client.storage.get(`task-scheduler:last-event:${task.id}`)
-          if (event) {
-            // Update running state
-            const existing = running.get(task.id)
-            if (existing) {
-              existing.iteration = event.runIndex
-              existing.deadlineMs = Date.now() + task.budget.minutes * 60_000
+          const intent = await client.storage.get(`task-scheduler:run-intent:${task.id}`)
+          if (intent && !running.has(task.id)) {
+            await client.storage.remove(`task-scheduler:run-intent:${task.id}`)
+            void runTaskLoop(task).catch((err) => {
+              ui.toast.show({ title: `task-scheduler ${task.id}`, message: `Error: ${err}`, variant: "error" })
+              running.delete(task.id)
+            })
+          }
+          const stopIntent = await client.storage.get(`task-scheduler:stop-intent:${task.id}`)
+          if (stopIntent) {
+            await client.storage.remove(`task-scheduler:stop-intent:${task.id}`)
+            const entry = running.get(task.id)
+            if (entry) {
+              try {
+                await client.session.interrupt({ sessionID: entry.sessionID })
+              } catch {}
+              running.delete(task.id)
+              ui.toast.show({ title: `task-scheduler ${task.id}`, message: "Stopped", variant: "info" })
             }
           }
         }
       } catch {}
     }, 2000)
 
-    // Palette command: list tasks
+    // Palette commands
     context.keymap.layer(() => ({
       mode: "global",
       commands: [
@@ -54,6 +182,55 @@ export default Plugin.define({
           run: () => {
             const lines = tasks.map((t) => `- ${t.id} (${t.start}, every ${t.loop?.every ?? "manual"})`).join("\n")
             ui.toast.show({ title: "task-scheduler", message: lines || "No tasks configured", variant: "info", duration: 10000 })
+          },
+        },
+        {
+          id: "task-scheduler.run",
+          title: "Task scheduler: run a task",
+          palette: true,
+          slash: { name: "task", aliases: ["run"], arguments: true },
+          run: async (input) => {
+            const id = (input ?? "").trim()
+            if (!id) {
+              ui.toast.show({ title: "task-scheduler", message: "Usage: /task run <id>", variant: "info" })
+              return
+            }
+            const task = tasks.find((t) => t.id === id)
+            if (!task) {
+              ui.toast.show({ title: "task-scheduler", message: `Unknown task: ${id}`, variant: "error" })
+              return
+            }
+            if (running.has(task.id)) {
+              ui.toast.show({ title: `task-scheduler ${task.id}`, message: "Already running", variant: "warning" })
+              return
+            }
+            void runTaskLoop(task).catch((err) => {
+              ui.toast.show({ title: `task-scheduler ${task.id}`, message: `Error: ${err}`, variant: "error" })
+              running.delete(task.id)
+            })
+            ui.toast.show({ title: `task-scheduler ${task.id}`, message: "Started", variant: "success" })
+          },
+        },
+        {
+          id: "task-scheduler.stop",
+          title: "Task scheduler: stop a task",
+          palette: true,
+          run: async (input) => {
+            const id = (input ?? "").trim()
+            if (!id) {
+              ui.toast.show({ title: "task-scheduler", message: "Usage: /task stop <id>", variant: "info" })
+              return
+            }
+            const entry = running.get(id)
+            if (!entry) {
+              ui.toast.show({ title: "task-scheduler", message: `No running task: ${id}`, variant: "info" })
+              return
+            }
+            try {
+              await client.session.interrupt({ sessionID: entry.sessionID })
+            } catch {}
+            running.delete(id)
+            ui.toast.show({ title: `task-scheduler ${id}`, message: "Stopped", variant: "info" })
           },
         },
       ],
@@ -69,3 +246,7 @@ export default Plugin.define({
     }
   },
 })
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms))
+}
