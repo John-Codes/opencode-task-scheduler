@@ -325,8 +325,8 @@ export class TaskEngine {
     })
   }
 
-  private async handleCommand(sessionID: string, prompt: string) {
-    const args = prompt.trim().split(/\s+/)
+  private async handleCommand(sessionID: string, prompt: { text?: string }) {
+    const args = (prompt.text ?? "").trim().split(/\s+/)
     const verb = args[0]
     const id = args[1]
 
