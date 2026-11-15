@@ -58,6 +58,37 @@ export default Plugin.define({
         at: Date.now(),
       })
 
+      // Test: create a session immediately to verify plugin session API works
+      try {
+        const test = await ctx.session.create({
+          id: `task-scheduler-setup-test-${Date.now()}`,
+          title: "⏱ setup test session",
+          location: { directory: ctx.location.directory },
+        })
+        await ctx.storage.set("task-scheduler:setup-log", {
+          event: "setup-test-session-created",
+          sessionID: test.id,
+          at: Date.now(),
+        })
+        await ctx.session.prompt({
+          sessionID: test.id,
+          text: "Reply with exactly: SETUP_TEST_OK",
+          delivery: "steer",
+        })
+        await ctx.storage.set("task-scheduler:setup-log", {
+          event: "setup-test-prompt-sent",
+          sessionID: test.id,
+          at: Date.now(),
+        })
+      } catch (err) {
+        await ctx.storage.set("task-scheduler:setup-log", {
+          event: "setup-test-failed",
+          error: String(err),
+          stack: (err as Error)?.stack,
+          at: Date.now(),
+        })
+      }
+
       return cleanup
     } catch (err) {
       await ctx.storage.set("task-scheduler:setup-log", {
