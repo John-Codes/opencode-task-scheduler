@@ -1,0 +1,33 @@
+{
+  "name": "opencode-task-scheduler",
+  "version": "1.0.0",
+  "description": "Run agentic tasks on startup or on a loop — every X interval, for N iterations, or continuous until the agent calls task_done.",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./tui": "./src/tui.tsx"
+  },
+  "files": ["src"],
+  "dependencies": {
+    "@opencode/plugin": "latest"
+  },
+  "peerDependencies": {
+    "@opentui/core": ">=0.8.4",
+    "@opentui/solid": ">=0.8.4",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/core": { "optional": true },
+    "@opentui/solid": { "optional": true },
+    "solid-js": { "optional": true }
+  },
+  "engines": {
+    "opencode": ">=2.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anomalyco/opencode-task-scheduler.git"
+  },
+  "license": "MIT"
+}
