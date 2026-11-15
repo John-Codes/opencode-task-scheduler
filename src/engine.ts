@@ -411,8 +411,23 @@ export class TaskEngine {
       } else {
         await this.reply(sessionID, `No running task: ${id}`)
       }
+    } else if (verb === "debug") {
+      try {
+        const created = await this.ctx.session.create({
+          id: `task-debug-${Date.now()}`,
+          title: "⏱ debug session",
+          location: { directory: this.ctx.location.directory },
+        })
+        await this.ctx.session.prompt({
+          sessionID: created.id,
+          text: "Reply with exactly: DEBUG_OK",
+          delivery: "steer",
+        })
+        await this.reply(sessionID, `Debug: created session ${created.id}, prompt sent`)
+      } catch (err) {
+        await this.reply(sessionID, `Debug failed: ${String(err)}`)
+      }
     } else if (verb === "status") {
-      const task = this.tasks.find((t) => t.id === id)
       const run = this.runs.get(id)
       const state = await this.store.getState(id)
       let line = `Task ${id}: ${state.status}`
