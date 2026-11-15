@@ -154,12 +154,19 @@ export class TaskEngine {
           title: "⏱ debug session",
           location: { directory: this.ctx.location.directory },
         })
+        // List sessions to verify creation
+        const sessions = await this.ctx.session.list({ limit: 5 })
+        const sessionList = (sessions as any).data ?? []
+        await this.ctx.session.synthetic({
+          sessionID,
+          text: `Debug: created session ${created.id}. Total sessions: ${sessionList.length}. Last: ${sessionList[0]?.title || 'none'}`,
+          description: "task-scheduler",
+        })
         await this.ctx.session.prompt({
           sessionID: created.id,
           text: "Reply with exactly: DEBUG_OK",
           delivery: "steer",
         })
-        await this.reply(sessionID, `Debug: created session ${created.id}, prompt sent`)
       } catch (err) {
         await this.reply(sessionID, `Debug failed: ${String(err)}`)
       }
