@@ -38,7 +38,8 @@ export interface TaskConfig {
   permissions?: { action: string; resource: string; effect: "allow" | "ask" | "deny" }[]
 }
 
-export function parseEvery(spec: string): number {
+export function parseEvery(spec: string | number): number {
+  if (typeof spec === "number") return spec * 1_000
   const m = spec.trim().match(/^(\d+)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)?$/i)
   if (!m) throw new Error(`Invalid interval: ${spec}`)
   const n = Number(m[1])
