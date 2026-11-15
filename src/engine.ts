@@ -107,12 +107,14 @@ export class TaskEngine {
   private arm(task: TaskConfig) {
     if (this.locks.has(task.id)) return
     this.locks.add(task.id)
+    console.error(`[task-scheduler] arming task ${task.id} (start: ${task.start})`)
     void this.runLoop(task).catch((err) => {
       console.error(`[task-scheduler] task ${task.id} loop error:`, err)
       this.locks.delete(task.id)
     })
   }
   private async runLoop(task: TaskConfig) {
+    console.error(`[task-scheduler] runLoop entered for task ${task.id}`)
     const everyMs = task.loop.every ? parseEvery(task.loop.every) : 0
     let iteration = 0
 
@@ -195,30 +197,42 @@ export class TaskEngine {
       for (const t of taskControlTools(state)) editor.add(t)
     })
 
+    const location = { directory: this.ctx.location.directory }
+
     let sessionID: string
     if (task.session === "current") {
-      // Use the active session; fall back to creating one.
       sessionID = await this.currentOrCreateSession(task)
     } else {
-      const created = await this.ctx.session.create({
-        id: `task-${task.id}-${iteration}-${startedAt}`,
-        title: `⏱ ${task.id} · run ${iteration}`,
-        agent: task.agent,
-        model: task.model,
-        location: this.ctx.session.create.length ? undefined : undefined,
-        permissions: task.budget.autoApprove
-          ? [{ action: "*", resource: "*", effect: "allow" }, ...(task.budget.deny ?? []).map((d) => ({ action: "bash", resource: d, effect: "deny" }))]
-          : task.permissions,
-      })
-      sessionID = created.id
+      try {
+        const created = await this.ctx.session.create({
+          id: `task-${task.id}-${iteration}-${startedAt}`,
+          title: `⏱ ${task.id} · run ${iteration}`,
+          agent: task.agent,
+          model: task.model,
+          location,
+          permissions: task.budget.autoApprove
+            ? [{ action: "*", resource: "*", effect: "allow" }, ...(task.budget.deny ?? []).map((d) => ({ action: "bash", resource: d, effect: "deny" }))]
+            : task.permissions,
+        })
+        sessionID = created.id
+        console.error(`[task-scheduler] created session ${sessionID} for task ${task.id} iteration ${iteration}`)
+      } catch (err) {
+        console.error(`[task-scheduler] session.create failed for task ${task.id}:`, err)
+        throw err
+      }
     }
 
     // Pin goal + deadline into instructions so it survives compaction.
-    await this.ctx.session.instructions.entry.put({
-      sessionID,
-      key: "task-scheduler/goal",
-      value: `TASK: ${task.prompt}\nSTOP WHEN: the agent calls task_done, or the deadline of ${new Date(deadlineMs).toISOString()} is reached.\nYou may call task_extend(minutes, reason) if you need more time.\nCurrent iteration: ${iteration}`,
-    })
+    try {
+      await this.ctx.session.instructions.entry.put({
+        sessionID,
+        key: "task-scheduler/goal",
+        value: `TASK: ${task.prompt}\nSTOP WHEN: the agent calls task_done, or the deadline of ${new Date(deadlineMs).toISOString()} is reached.\nYou may call task_extend(minutes, reason) if you need more time.\nCurrent iteration: ${iteration}`,
+      })
+    } catch (err) {
+      console.error(`[task-scheduler] instructions.entry.put failed for task ${task.id}:`, err)
+      // non-fatal, continue
+    }
 
     return { task, store: this.store, sessionID, state, abort, iteration, deadlineMs, startedAt }
   }
@@ -341,6 +355,7 @@ export class TaskEngine {
       const task = this.tasks.find((t) => t.id === id)
       if (!task) { await this.reply(sessionID, `Unknown task: ${id}`); return }
       if (this.locks.has(task.id)) { await this.reply(sessionID, `Task ${id} is already running`); return }
+      console.error(`[task-scheduler] manual run ${id} started`)
       this.locks.add(task.id)
       void this.runLoop(task).catch((err) => {
         console.error(`[task-scheduler] manual run ${id} error:`, err)
