@@ -1,7 +1,7 @@
 import { Plugin } from "@opencode/plugin"
 import { TaskStore } from "./state.js"
 import { readLastOutcome, costUSD, tokensUsed, formatMinutes } from "./runner.js"
-import { parseEvery, jitter, type TaskConfig, type Until } from "./schedule.js"
+import { parseEvery, jitter, type TaskConfig } from "./schedule.js"
 
 export class TaskEngine {
   private locks = new Set<string>()
@@ -96,18 +96,24 @@ export class TaskEngine {
       await this.reply(sessionID, `Started task ${id}`)
     } else if (verb === "debug") {
       try {
-        // First, just prompt the current session to verify session.prompt works
-        await this.ctx.session.prompt({
-          sessionID,
-          text: "Reply with exactly: PROMPT_OK",
-          delivery: "steer",
+        // Test fetch directly to the OpenCode API
+        const baseUrl = "http://127.0.0.1:49374"
+        const resp = await fetch(`${baseUrl}/api/session`, {
+          method: "GET",
+          headers: { "Content-Type": "application/json" },
         })
-        await this.reply(sessionID, "Debug: prompt sent to current session")
+        const data = await resp.json()
+        const sessions = data.data || []
+        await this.ctx.session.synthetic({
+          sessionID,
+          text: `Debug: fetch /api/session returned ${sessions.length} sessions. First: ${sessions[0]?.title || 'none'}`,
+          description: "task-scheduler",
+        })
       } catch (err) {
-        await this.reply(sessionID, `Debug failed: ${String(err)}`)
+        await this.reply(sessionID, `Debug fetch failed: ${String(err)}`)
       }
     } else if (verb === "stop") {
-      await this.reply(sessionID, "Stop is not yet implemented for current-session tasks. Interrupt manually.")
+      await this.reply(sessionID, "Stop not yet implemented.")
     } else if (verb === "list") {
       const lines = this.tasks.map((t) => `- ${t.id} (${t.start}, session:${t.session})`).join("\n")
       await this.reply(sessionID, `Tasks:\n${lines}`)
@@ -121,10 +127,8 @@ export class TaskEngine {
     const everyMs = task.loop.every ? parseEvery(task.loop.every) : 0
     let iteration = 0
 
-    // For session:"new", try to create a session; fall back to the passed sessionID
     let targetSessionID = sessionID
     if (task.session === "new" && !sessionID) {
-      // Startup task with no session - create one
       try {
         const created = await this.ctx.session.create({
           id: `task-${task.id}-${Date.now()}`,
