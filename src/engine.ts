@@ -96,7 +96,12 @@ export class TaskEngine {
       await this.reply(sessionID, `Started task ${id}`)
     } else if (verb === "debug") {
       try {
-        // Test fetch directly to the OpenCode API
+        // Write debug info to a file we can read
+        const fs = await import("fs")
+        const marker = `DEBUG at ${new Date().toISOString()}: sessionID=${sessionID}, location.dir=${this.ctx.location.directory}\n`
+        fs.appendFileSync("/tmp/task-scheduler-debug.log", marker)
+        
+        // Also try fetch
         const baseUrl = "http://127.0.0.1:49374"
         const resp = await fetch(`${baseUrl}/api/session`, {
           method: "GET",
@@ -104,13 +109,17 @@ export class TaskEngine {
         })
         const data = await resp.json()
         const sessions = data.data || []
+        fs.appendFileSync("/tmp/task-scheduler-debug.log", `fetch: ${sessions.length} sessions\n`)
+        
         await this.ctx.session.synthetic({
           sessionID,
-          text: `Debug: fetch /api/session returned ${sessions.length} sessions. First: ${sessions[0]?.title || 'none'}`,
+          text: `Debug: check /tmp/task-scheduler-debug.log`,
           description: "task-scheduler",
         })
       } catch (err) {
-        await this.reply(sessionID, `Debug fetch failed: ${String(err)}`)
+        const fs = await import("fs")
+        fs.appendFileSync("/tmp/task-scheduler-debug.log", `ERROR: ${String(err)}\n`)
+        await this.reply(sessionID, `Debug failed: ${String(err)}`)
       }
     } else if (verb === "stop") {
       await this.reply(sessionID, "Stop not yet implemented.")
