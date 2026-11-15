@@ -27,7 +27,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/anomalyco/opencode-task-scheduler.git"
+    "url": "git+https://github.com/John-Codes/opencode-task-scheduler.git"
   },
   "license": "MIT"
 }
