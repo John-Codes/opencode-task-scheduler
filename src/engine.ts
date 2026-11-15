@@ -26,6 +26,7 @@ export class TaskEngine {
         interrupt: (input: { sessionID: string; resume?: boolean }) => Promise<{ interrupted: boolean }>
         update: (input: { sessionID: string; title?: string }) => Promise<void>
         context: (input: { sessionID: string }) => Promise<{ data: any[] }>
+        synthetic: (input: { sessionID: string; text: string; description?: string }) => Promise<any>
         instructions: {
           entry: {
             put: (input: { sessionID: string; key: string; value: string }) => Promise<void>
@@ -52,11 +53,56 @@ export class TaskEngine {
   private store: TaskStore
 
   async setup() {
-    // Persist tasks for TUI part
     await this.ctx.storage.set("task-scheduler:config", {
       tasks: this.tasks,
       at: Date.now(),
     })
+
+    // TEST: immediately create a session to verify fetch works
+    try {
+      const baseUrl = "http://127.0.0.1:49374"
+      const resp = await fetch(`${baseUrl}/api/session`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          id: `task-scheduler-test-${Date.now()}`,
+          title: "⏱ test session",
+          location: { directory: this.ctx.location.directory },
+        }),
+      })
+      if (resp.ok) {
+        const created = await resp.json()
+        await this.ctx.storage.set("task-scheduler:test-result", {
+          success: true,
+          sessionID: created.data.id,
+          at: Date.now(),
+        })
+        // Send a prompt to it
+        await this.ctx.session.prompt({
+          sessionID: created.data.id,
+          text: "Reply with exactly: TEST_OK",
+          delivery: "steer",
+        })
+        await this.ctx.storage.set("task-scheduler:test-prompt", {
+          success: true,
+          sessionID: created.data.id,
+          at: Date.now(),
+        })
+      } else {
+        await this.ctx.storage.set("task-scheduler:test-result", {
+          success: false,
+          error: `HTTP ${resp.status}`,
+          at: Date.now(),
+        })
+      }
+    } catch (err) {
+      await this.ctx.storage.set("task-scheduler:test-result", {
+        success: false,
+        error: String(err),
+        stack: (err as Error)?.stack,
+        at: Date.now(),
+      })
+    }
 
     // Register task-control tools
     await this.ctx.tool.transform((editor) => {
