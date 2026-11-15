@@ -96,16 +96,13 @@ export class TaskEngine {
       await this.reply(sessionID, `Started task ${id}`)
     } else if (verb === "debug") {
       try {
-        const created = await this.ctx.session.create({
-          id: `task-debug-${Date.now()}`,
-          title: "⏱ debug session",
-          location: { directory: this.ctx.location.directory },
-        })
-        await this.ctx.session.synthetic({
+        // First, just prompt the current session to verify session.prompt works
+        await this.ctx.session.prompt({
           sessionID,
-          text: `Debug: session.create returned id=${created.id}`,
-          description: "task-scheduler",
+          text: "Reply with exactly: PROMPT_OK",
+          delivery: "steer",
         })
+        await this.reply(sessionID, "Debug: prompt sent to current session")
       } catch (err) {
         await this.reply(sessionID, `Debug failed: ${String(err)}`)
       }
