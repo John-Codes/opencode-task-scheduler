@@ -39,7 +39,7 @@ export default Plugin.define({
         title: `⏱ ${task.id} · run ${iteration}`,
         location: { directory: location?.directory ?? "/home/aisurvivor" },
       })
-      return created.id
+      return created.data.id
     }
 
     async function runTaskLoop(task: TaskConfig) {
