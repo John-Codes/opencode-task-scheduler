@@ -112,7 +112,6 @@ export class TaskEngine {
       this.locks.delete(task.id)
     })
   }
-
   private async runLoop(task: TaskConfig) {
     const everyMs = task.loop.every ? parseEvery(task.loop.every) : 0
     let iteration = 0
@@ -150,6 +149,14 @@ export class TaskEngine {
           await this.finishRun(task, run, "timed-out", `Cost budget reached ($${task.budget.maxCostUSD})`)
           break
         }
+      } catch (err) {
+        await this.ctx.storage.set(`task-scheduler:error:${task.id}`, {
+          taskID: task.id,
+          iteration,
+          error: String(err),
+          at: Date.now(),
+        })
+        throw err
       } finally {
         if (run) {
           this.runs.delete(task.id)
