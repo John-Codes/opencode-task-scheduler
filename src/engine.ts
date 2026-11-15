@@ -3,16 +3,8 @@ import { TaskStore } from "./state.js"
 import { readLastOutcome, costUSD, tokensUsed, formatMinutes } from "./runner.js"
 import { parseEvery, jitter, type TaskConfig, type Until } from "./schedule.js"
 
-interface RunCtx {
-  task: TaskConfig
-  sessionID: string
-  startedAt: number
-  deadlineMs: number
-}
-
 export class TaskEngine {
   private locks = new Set<string>()
-  private runs = new Map<string, RunCtx>()
 
   constructor(
     private ctx: {
@@ -23,6 +15,7 @@ export class TaskEngine {
         interrupt: (input: { sessionID: string }) => Promise<{ interrupted: boolean }>
         update: (input: { sessionID: string; title?: string }) => Promise<void>
         context: (input: { sessionID: string }) => Promise<{ data: any[] }>
+        synthetic: (input: { sessionID: string; text: string; description?: string }) => Promise<any>
       }
       command: {
         transform: (cb: (editor: { add: (d: { name: string; description?: string; execute: (i: any) => Promise<void> }) => void }) => void) => Promise<{ dispose: () => Promise<void> }>
@@ -59,7 +52,6 @@ export class TaskEngine {
 
   teardown() {
     this.locks.clear()
-    this.runs.clear()
   }
 
   private async log(taskID: string, event: string, data: any) {
@@ -71,7 +63,7 @@ export class TaskEngine {
   private arm(task: TaskConfig) {
     if (this.locks.has(task.id)) return
     this.locks.add(task.id)
-    void this.runLoop(task).catch((err) => {
+    void this.runTask(task, null).catch((err) => {
       void this.ctx.storage.set(`task-scheduler:error:${task.id}`, {
         taskID: task.id,
         error: String(err),
@@ -80,51 +72,6 @@ export class TaskEngine {
       })
       this.locks.delete(task.id)
     })
-  }
-
-  private async runLoop(task: TaskConfig) {
-    await this.log(task.id, "runLoop-entered", { every: task.loop.every, maxIterations: task.loop.maxIterations })
-    const everyMs = task.loop.every ? parseEvery(task.loop.every) : 0
-    let iteration = 0
-
-    if (task.loop.initialDelay) {
-      await sleep(parseEvery(task.loop.initialDelay))
-    }
-
-    while (true) {
-      iteration++
-      if (task.loop.maxIterations != null && iteration > task.loop.maxIterations) break
-
-      let sessionID: string
-      try {
-        if (task.session === "new") {
-          const created = await this.ctx.session.create({
-            id: `task-${task.id}-${iteration}-${Date.now()}`,
-            title: `⏱ ${task.id} · run ${iteration}`,
-            location: { directory: this.ctx.location.directory },
-          })
-          sessionID = created.id
-          await this.log(task.id, "session-created", { sessionID, iteration })
-        } else {
-          sessionID = sessionID // will be set below
-        }
-      } catch (err) {
-        await this.ctx.storage.set(`task-scheduler:error:${task.id}`, {
-          taskID: task.id,
-          iteration,
-          error: `session.create failed: ${String(err)}`,
-          stack: (err as Error)?.stack,
-          at: Date.now(),
-        })
-        throw err
-      }
-
-      // For session:"current", we need the calling sessionID - but runLoop doesn't have it.
-      // We'll handle this in handleCommand instead.
-      break // placeholder - actual logic in handleCommand
-    }
-
-    this.locks.delete(task.id)
   }
 
   private async handleCommand(sessionID: string, prompt: { text?: string }) {
@@ -154,36 +101,52 @@ export class TaskEngine {
           title: "⏱ debug session",
           location: { directory: this.ctx.location.directory },
         })
-        // List sessions to verify creation
-        const sessions = await this.ctx.session.list({ limit: 5 })
-        const sessionList = (sessions as any).data ?? []
         await this.ctx.session.synthetic({
           sessionID,
-          text: `Debug: created session ${created.id}. Total sessions: ${sessionList.length}. Last: ${sessionList[0]?.title || 'none'}`,
+          text: `Debug: session.create returned id=${created.id}`,
           description: "task-scheduler",
-        })
-        await this.ctx.session.prompt({
-          sessionID: created.id,
-          text: "Reply with exactly: DEBUG_OK",
-          delivery: "steer",
         })
       } catch (err) {
         await this.reply(sessionID, `Debug failed: ${String(err)}`)
       }
     } else if (verb === "stop") {
-      await this.reply(sessionID, "Use /task list to see tasks")
+      await this.reply(sessionID, "Stop is not yet implemented for current-session tasks. Interrupt manually.")
     } else if (verb === "list") {
       const lines = this.tasks.map((t) => `- ${t.id} (${t.start}, session:${t.session})`).join("\n")
       await this.reply(sessionID, `Tasks:\n${lines}`)
     } else {
-      await this.reply(sessionID, "Usage: /task run|stop|attach|status|list <id>")
+      await this.reply(sessionID, "Usage: /task run|stop|list <id>")
     }
   }
 
-  private async runTask(task: TaskConfig, sessionID: string) {
+  private async runTask(task: TaskConfig, sessionID: string | null) {
     await this.log(task.id, "runTask-entered", { sessionID })
     const everyMs = task.loop.every ? parseEvery(task.loop.every) : 0
     let iteration = 0
+
+    // For session:"new", try to create a session; fall back to the passed sessionID
+    let targetSessionID = sessionID
+    if (task.session === "new" && !sessionID) {
+      // Startup task with no session - create one
+      try {
+        const created = await this.ctx.session.create({
+          id: `task-${task.id}-${Date.now()}`,
+          title: `⏱ ${task.id} · run 1`,
+          location: { directory: this.ctx.location.directory },
+        })
+        targetSessionID = created.id
+        await this.log(task.id, "session-created", { sessionID: targetSessionID })
+      } catch (err) {
+        await this.ctx.storage.set(`task-scheduler:error:${task.id}`, {
+          taskID: task.id,
+          error: `session.create failed: ${String(err)}`,
+          stack: (err as Error)?.stack,
+          at: Date.now(),
+        })
+        this.locks.delete(task.id)
+        return
+      }
+    }
 
     while (true) {
       iteration++
@@ -196,24 +159,29 @@ export class TaskEngine {
       const minsLeft = Math.max(0, Math.ceil((deadlineMs - Date.now()) / 60_000))
       const fullText = `${text}\n\n[time left: ${minsLeft} min][iteration: ${iteration}]`
 
-      await this.ctx.session.update({ sessionID, title: `⏱ ${task.id} · run ${iteration}` })
-      await this.ctx.session.prompt({ sessionID, text: fullText, delivery: "steer" })
+      if (!targetSessionID) {
+        await this.log(task.id, "no-session", { iteration })
+        break
+      }
+
+      await this.ctx.session.update({ sessionID: targetSessionID, title: `⏱ ${task.id} · run ${iteration}` })
+      await this.ctx.session.prompt({ sessionID: targetSessionID, text: fullText, delivery: "steer" })
 
       try {
-        await this.ctx.session.wait({ sessionID })
+        await this.ctx.session.wait({ sessionID: targetSessionID })
       } catch {
         await sleep(2_000)
       }
 
-      const ctx = await this.ctx.session.context({ sessionID })
+      const ctx = await this.ctx.session.context({ sessionID: targetSessionID })
       const messages = ctx.data ?? []
       const { outcome, cost, tokens } = readLastOutcome(messages)
       const c = costUSD(cost)
 
       await this.log(task.id, "iteration-complete", { iteration, outcome, costUSD: c, tokens })
 
-      if (outcome === "succeeded" || iteration >= (task.loop.maxIterations || 999)) {
-        await this.finishRun(task, sessionID, iteration, "done")
+      if (iteration >= (task.loop.maxIterations || 999)) {
+        await this.finishRun(task, targetSessionID, iteration, "done")
         break
       }
 
